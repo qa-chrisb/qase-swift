@@ -6,19 +6,18 @@ import QaseCore
 ///
 /// Provides static methods for step tracking, attachments, and configuration.
 /// Registration is done via ``QaseTestObserver/register()``.
-@MainActor
 public final class Qase: Sendable {
     /// Shared singleton used by annotations, steps, and attachments.
-    nonisolated static let shared = Qase()
+    static let shared = Qase()
 
-    nonisolated let store = MetadataStore()
+    let store = MetadataStore()
 
-    private nonisolated init() {}
+    private init() {}
 
     // MARK: - Configuration
 
     /// Configures the reporter programmatically. Call before tests start.
-    nonisolated public static func configure(
+    public static func configure(
         token: String? = nil,
         project: String? = nil,
         mode: QaseMode? = nil,
@@ -39,7 +38,7 @@ public final class Qase: Sendable {
     /// Executes a named test step, tracking it for Qase reporting.
     ///
     /// Wraps `XCTContext.runActivity(named:)` so steps appear in both Xcode results and Qase.
-    /// Supports nesting naturally.
+    /// Supports nesting naturally. Must be called from the main thread (XCTest's default).
     ///
     /// ```swift
     /// Qase.step("Login") {
@@ -48,7 +47,7 @@ public final class Qase: Sendable {
     /// }
     /// ```
     @discardableResult
-    public static func step<T>(
+    public static func step<T: Sendable>(
         _ name: String,
         expected: String? = nil,
         body: () throws -> T
@@ -83,8 +82,13 @@ public final class Qase: Sendable {
 
         let result: T
         do {
-            result = try XCTContext.runActivity(named: name) { _ in
-                try body()
+            // XCTest always runs on the main thread. We use assumeIsolated to
+            // satisfy the compiler's MainActor requirement on runActivity.
+            nonisolated(unsafe) let unsafeBody = body
+            result = try MainActor.assumeIsolated {
+                try XCTContext.runActivity(named: name) { _ in
+                    try unsafeBody()
+                }
             }
         } catch {
             stepStatus = .failed
@@ -128,7 +132,7 @@ public final class Qase: Sendable {
     }
 
     /// Recursively appends a step to the correct parent in the step hierarchy.
-    nonisolated private static func appendNestedStep(
+    private static func appendNestedStep(
         _ step: StepResult,
         to steps: inout [StepResult],
         at path: [Int]
@@ -149,7 +153,7 @@ public final class Qase: Sendable {
     // MARK: - Attachments
 
     /// Attaches raw data to the current test's Qase result.
-    nonisolated public static func attach(data: Data, named name: String, mimeType: String) {
+    public static func attach(data: Data, named name: String, mimeType: String) {
         guard let testID = currentTestID() else { return }
         let info = AttachmentInfo(data: data, name: name, mimeType: mimeType)
         shared.store.update(for: testID) { metadata in
@@ -158,12 +162,16 @@ public final class Qase: Sendable {
     }
 
     /// Attaches a screenshot to the current test's Qase result.
+    /// Must be called from the main thread (XCTest's default).
     public static func attach(screenshot: XCUIScreenshot, named name: String = "screenshot") {
-        attach(data: screenshot.pngRepresentation, named: "\(name).png", mimeType: "image/png")
+        let pngData = MainActor.assumeIsolated {
+            screenshot.pngRepresentation
+        }
+        attach(data: pngData, named: "\(name).png", mimeType: "image/png")
     }
 
     /// Attaches a file at the given URL to the current test's Qase result.
-    nonisolated public static func attach(file url: URL) {
+    public static func attach(file url: URL) {
         guard let data = try? Data(contentsOf: url) else { return }
         let mimeType = url.pathExtension == "json" ? "application/json"
             : url.pathExtension == "png" ? "image/png"
@@ -174,7 +182,7 @@ public final class Qase: Sendable {
 
     // MARK: - Helpers
 
-    nonisolated private static func currentTestID() -> ObjectIdentifier? {
+    private static func currentTestID() -> ObjectIdentifier? {
         Thread.current.threadDictionary["__qase_test_id__"] as? ObjectIdentifier
     }
 }
