@@ -32,7 +32,26 @@ public final class QaseTestObserver: NSObject, @unchecked Sendable, XCTestObserv
     // MARK: - XCTestObservation
 
     public func testBundleWillStart(_ testBundle: Bundle) {
-        config = ConfigLoader().load(overrides: Self.configOverride)
+        // Search for .env and qase.config.json in the source root if available
+        let searchPaths: [String] = {
+            var paths: [String] = []
+            // __XCODE_BUILT_PRODUCTS_DIR_PATHS or SOURCE_ROOT are set by Xcode
+            if let sourceRoot = ProcessInfo.processInfo.environment["QASE_PROJECT_DIR"] {
+                paths.append(sourceRoot)
+            }
+            // Walk up from the test bundle to find the project root
+            var dir = (testBundle.bundlePath as NSString).deletingLastPathComponent
+            for _ in 0..<10 {
+                let envPath = (dir as NSString).appendingPathComponent(".env")
+                if FileManager.default.fileExists(atPath: envPath) {
+                    paths.append(dir)
+                    break
+                }
+                dir = (dir as NSString).deletingLastPathComponent
+            }
+            return paths
+        }()
+        config = ConfigLoader().load(overrides: Self.configOverride, searchPaths: searchPaths)
 
         guard config.mode != .off else {
             QaseLogger.log("Qase reporting is off")

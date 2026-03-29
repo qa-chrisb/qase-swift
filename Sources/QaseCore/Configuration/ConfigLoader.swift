@@ -6,24 +6,25 @@ public struct ConfigLoader: Sendable {
     public init() {}
 
     /// Resolves configuration by merging all sources.
-    /// - Parameter overrides: Programmatic overrides (highest priority).
+    /// - Parameters:
+    ///   - overrides: Programmatic overrides (highest priority).
+    ///   - searchPaths: Additional directories to search for `.env` and `qase.config.json` files.
     /// - Returns: Fully resolved ``QaseConfig``.
-    public func load(overrides: QaseConfig? = nil) -> QaseConfig {
-        let fileConfig = loadFromFile()
+    public func load(overrides: QaseConfig? = nil, searchPaths: [String] = []) -> QaseConfig {
+        let fileConfig = loadFromFile(searchPaths: searchPaths)
+        let dotenvConfig = loadFromDotEnv(searchPaths: searchPaths)
         let envConfig = loadFromEnvironment()
 
-        // Start with defaults, layer file, then env, then explicit overrides
+        // Priority: defaults < config file < .env file < env vars < explicit overrides
         var config = QaseConfig()
 
-        // File layer
         if let file = fileConfig {
             merge(into: &config, from: file)
         }
-
-        // Env layer
+        if let dotenv = dotenvConfig {
+            merge(into: &config, from: dotenv)
+        }
         merge(into: &config, from: envConfig)
-
-        // Explicit overrides
         if let overrides {
             merge(into: &config, from: overrides)
         }
@@ -69,13 +70,87 @@ public struct ConfigLoader: Sendable {
         return config
     }
 
+    // MARK: - .env File
+
+    private func loadFromDotEnv(searchPaths: [String]) -> QaseConfig? {
+        let fileManager = FileManager.default
+        let candidates = searchPaths + [fileManager.currentDirectoryPath]
+
+        var dotenv: [String: String]?
+        for dir in candidates {
+            let path = (dir as NSString).appendingPathComponent(".env")
+            if let contents = try? String(contentsOfFile: path, encoding: .utf8) {
+                dotenv = parseDotEnv(contents)
+                break
+            }
+        }
+
+        guard let env = dotenv else { return nil }
+
+        var config = QaseConfig()
+
+        // Support both QASE_TESTOPS_* and shorthand QASE_API_TOKEN / QASE_PROJECT_CODE
+        if let token = env["QASE_TESTOPS_API_TOKEN"] ?? env["QASE_API_TOKEN"], !token.isEmpty {
+            config.apiToken = token
+        }
+        if let project = env["QASE_TESTOPS_PROJECT"] ?? env["QASE_PROJECT_CODE"], !project.isEmpty {
+            config.project = project
+        }
+        if let mode = (env["QASE_MODE"]).flatMap(QaseMode.init(rawValue:)) {
+            config.mode = mode
+        }
+        if let host = env["QASE_TESTOPS_API_HOST"], !host.isEmpty {
+            config.host = host
+        }
+        if let title = env["QASE_TESTOPS_RUN_TITLE"], !title.isEmpty {
+            config.runTitle = title
+        }
+        if let complete = env["QASE_TESTOPS_RUN_COMPLETE"] {
+            config.autoComplete = complete.lowercased() == "true" || complete == "1"
+        }
+        if let debug = env["QASE_DEBUG"], debug.lowercased() == "true" || debug == "1" {
+            // Debug flag is handled by QaseLogger, not config — but log that we found a .env
+        }
+
+        QaseLogger.log("Loaded Qase config from .env file")
+        return config
+    }
+
+    private func parseDotEnv(_ contents: String) -> [String: String] {
+        var result: [String: String] = [:]
+        for line in contents.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
+            let parts = trimmed.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let key = String(parts[0]).trimmingCharacters(in: .whitespaces)
+            var value = String(parts[1]).trimmingCharacters(in: .whitespaces)
+            // Strip surrounding quotes
+            if (value.hasPrefix("\"") && value.hasSuffix("\"")) ||
+               (value.hasPrefix("'") && value.hasSuffix("'")) {
+                value = String(value.dropFirst().dropLast())
+            }
+            result[key] = value
+        }
+        return result
+    }
+
     // MARK: - Config File
 
-    private func loadFromFile() -> QaseConfig? {
+    private func loadFromFile(searchPaths: [String] = []) -> QaseConfig? {
         let fileManager = FileManager.default
-        let configPath = fileManager.currentDirectoryPath + "/qase.config.json"
+        let candidates = searchPaths + [fileManager.currentDirectoryPath]
 
-        guard let data = fileManager.contents(atPath: configPath) else { return nil }
+        var data: Data?
+        for dir in candidates {
+            let path = (dir as NSString).appendingPathComponent("qase.config.json")
+            if let d = fileManager.contents(atPath: path) {
+                data = d
+                break
+            }
+        }
+
+        guard let data else { return nil }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let testops = json["testops"] as? [String: Any]
